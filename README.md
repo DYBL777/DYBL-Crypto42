@@ -6,7 +6,7 @@ A 6-year breathing prediction game. Pick which 6 of 42 cryptocurrencies will out
 
 50 code fixes + 16 documentation notes across 4 versions. 1,663 lines.
 
-Built on the same pot engine as The Official Rug v1. Same Aave V3 yield, same OG endgame. Different game engine: Chainlink Price Feeds replace VRF.
+Built on the same pot engine as Letter Breathe v1. Same Aave V3 yield, same OG endgame. Different game engine: Chainlink Price Feeds replace VRF.
 
 ## The Game
 
