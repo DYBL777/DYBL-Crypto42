@@ -3,13 +3,17 @@
 // Change Date: 10 May 2029
 // On the Change Date, this code becomes available under MIT License.
 
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 /**
- * @title Crypto42 v1.0
+ * @title Crypto42 v1.4
  * @notice A 6-Year Breathing Prediction Game: Pick the Top 6 Performing Cryptos
  * @author DYBL Foundation
  * @dev Crypto42_v1.sol - Chainlink Price Feed Skill Game
+ *      v1.0: Initial contract. 1,094 lines.
+ *      v1.1: 21 pre-audit fixes (17 code + 4 documentation). See CHANGELOG.
+ *      v1.2: Endgame architecture, charity integration, treasury taper. See CHANGELOG.
+ *      v1.3: Charity removed, security fixes, NatSpec hardening. See CHANGELOG.
  *
  * BUILT ON: Crypto42 security patterns, yield handling,
  * and batch processing. Same pot mechanics. Different game engine.
@@ -27,7 +31,7 @@ pragma solidity ^0.8.24;
  *   1. Previous week finalizes -> snapshots all 42 start prices from feeds
  *   2. Week passes (7 days minimum cooldown)
  *   3. resolveWeek() called: reads all 42 end prices from feeds
- *   4. Calculates % change: (endPrice - startPrice) * 10000 / startPrice
+ *   4. Calculates % change: (endPrice - startPrice) * PRECISION_MULTIPLIER / startPrice
  *   5. Ranks all 42. Top 6 = winning combo.
  *   6. Tiebreaker: lower index wins (deterministic)
  *   7. Sets winningBitmask. Enters MATCHING. Synchronous. One tx.
@@ -35,24 +39,314 @@ pragma solidity ^0.8.24;
  * CHAINLINK SERVICES (NO VRF):
  *   Price Feeds: 42 AggregatorV3Interface feeds (one per crypto)
  *   Automation:  Weekly resolveWeek() trigger + batch processing
- *   Feed staleness: all 42 must be fresh or resolveWeek reverts
+ *   Feed staleness: stale/dead feeds disqualified via try/catch. Game continues.
  *   If feeds stale > 8 weeks: dormancy activates. Funds never stuck.
  *
  * EVERYTHING ELSE: IDENTICAL TO LETTER BREATHE v1
  *   Revenue split, Aave V3 yield, OG qualification, dormancy, treasury,
  *   solvency, self-cleaning draws, swap-and-pop, batched matching,
  *   batched distribution, all S1 security patterns.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * CHANGELOG
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * S2-FIX-01  Oracle resilience: try/catch on _resolveWeek().
+ *            One dead/stale/paused feed disqualifies that crypto.
+ *            Game never stalls. (MEDIUM)
+ *
+ * S2-FIX-02  Oracle resilience: try/catch on _snapshotStartPrices().
+ *            Dead feed at snapshot stores 0. resolveWeek disqualifies
+ *            startPrice <= 0. Chain of resilience across both touchpoints. (MEDIUM)
+ *
+ * S2-FIX-03  Precision upgrade: PRECISION_MULTIPLIER 10000 -> 10^10.
+ *            Matches Chainlink 8-decimal precision. Eliminates ties.
+ *            Two cryptos must move identically to 0.00000001% to tie. (LOW)
+ *
+ * S2-FIX-04  Stale start price check in _snapshotStartPrices().
+ *            Feed alive but stale at snapshot = stores 0 = disqualified.
+ *            Prevents performance calculation built on bad data. (MEDIUM)
+ *
+ * S2-FIX-05  getCurrentPerformance() try/catch.
+ *            One dead feed no longer reverts entire view function.
+ *            Frontend leaderboard stays live. (LOW)
+ *
+ * S2-FIX-06  Feed update timelock: proposeFeedUpdate/executeFeedUpdate/
+ *            cancelFeedUpdate. 7-day delay. Anyone can execute after
+ *            timelock. Owner cannot silently swap feeds to rig outcomes.
+ *            Replaces instant updatePriceFeed. (CRITICAL - trust surface)
+ *
+ * S2-FIX-07  Feed proposal overwrite prevention: AlreadyProposed error.
+ *            Must cancel existing proposal before proposing new one for
+ *            same index. Prevents silent clock resets. (LOW)
+ *
+ * S2-FIX-08  Permissionless emergency functions: emergencyResetDraw()
+ *            and forceCompleteDistribution() no longer onlyOwner.
+ *            14-day timeout IS the protection. If owner vanishes, anyone
+ *            can unstick the game. (MEDIUM - decentralisation)
+ *
+ * S2-FIX-09  NatSpec on emergency functions explaining deliberate
+ *            nonReentrant omission. No token transfers = no reentrancy
+ *            surface. Documentation, not code change. (INFORMATIONAL)
+ *
+ * S2-FIX-10  extendSubscription game phase check: GameClosed revert.
+ *            Prevents money being taken after closeGame() when no more
+ *            draws will ever happen. (HIGH - fund loss)
+ *
+ * S2-FIX-11  changePicks / changePicksBoth front-running prevention:
+ *            drawPhase must be IDLE. Attacker cannot read WeekResolved
+ *            event and swap to winning combo before matching runs.
+ *            (CRITICAL - direct fund theft)
+ *
+ * S2-FIX-12  Dormancy race condition closed: performUpkeep, triggerDraw,
+ *            and checkUpkeep all check dormancyActive. No draw can start
+ *            during dormancy batch processing. (LOW)
+ *
+ * S2-FIX-13  JP distribution double-bonus prevention: !jpHitThisWeek
+ *            guard on JP block entry. Uncapped JP loop (all JP winners
+ *            paid in one call). Bonus deducted once. (MEDIUM)
+ *
+ * S2-FIX-14  [SUPERSEDED by S2-FIX-20] Originally routed 100% to pot
+ *            during exhale. Replaced with linear treasury taper.
+ *            (MEDIUM - design correction)
+ *
+ * S2-FIX-15  Independent ticket matching: two tickets = two entries =
+ *            two payouts. Same address can appear twice in winner arrays.
+ *            distributePrizes handles naturally. Replaces best-of-two
+ *            logic. (HIGH - design correction)
+ *
+ * S2-FIX-16  rescueAbandonedPot(): permissionless, callable after week
+ *            312 with zero OGs and zero subs. Pot + JP reserve to
+ *            treasury. Prevents permanent fund lock. (LOW)
+ *
+ * S2-FIX-17  Fixed exhale treasury cap: periodStartTreasuryBalance
+ *            snapshots at period start. 20% cap consistent regardless
+ *            of withdrawal pattern within 30-day period. (LOW)
+ *
+ * S2-DOC-01  Gas asymmetry: final distributePrizes batch triggers
+ *            _finalizeWeek() with 42 feed reads. ~300-400k extra gas.
+ *
+ * S2-DOC-02  Degenerate combo: all feeds dead = [0,1,2,3,4,5].
+ *            Deterministic, harmless. Dormancy at 8 weeks if persistent.
+ *
+ * S2-DOC-03  Treasury naming: getCurrentTreasuryTakeBps is a boolean
+ *            gate (0 or 2500), not the actual treasury percentage.
+ *
+ * S2-DOC-04  Yield attribution: all Aave yield to prizePot only.
+ *            Treasury and jpReserve get zero yield. Intentional.
+ *
+ * ─── v1.2 CHANGES ────────────────────────────────────────────────────
+ *
+ * S2-FIX-18  Endgame split: closeGame distributes 80% OGs, 20% treasury.
+ *            Charity commitment is operational (from treasury), not
+ *            enforced on-chain. (HIGH - design)
+ *
+ * S2-FIX-19  [REMOVED in v1.3] Charity wallet timelock removed. Charity
+ *            will be handled off-chain from treasury allocation.
+ *
+ * S2-FIX-20  Treasury taper during exhale: treasury take declines linearly
+ *            from 25% to 0% over 52 exhale weeks. Replaces 100%-to-pot.
+ *            Smooth decline mirrors breathing mechanic. (MEDIUM - design)
+ *
+ * S2-FIX-21  rescueAbandonedPot time-based fallback: fires when real
+ *            wall-clock time exceeds (TOTAL_WEEKS + CLOSE_GRACE_WEEKS),
+ *            not just when currentWeek advances. Fixes fund lock when
+ *            game dies mid-run and no draws advance the week counter.
+ *            100% to treasury. (HIGH - fund lock prevention)
+ *
+ * S2-FIX-22  getPotHealth exhale accuracy: inflow calculation now reflects
+ *            actual treasury taper during exhale instead of constant 75%
+ *            pot split. Dashboard numbers match reality. (LOW)
+ *
+ * S2-FIX-23  [REMOVED in v1.3] charityBalance in solvency removed with
+ *            charity code cleanup.
+ *
+ * S2-FIX-24  getEstimatedOGShare reflects 80% endgame split. Shows
+ *            actual expected payout, not 100% of pot. (LOW)
+ *
+ * S2-DOC-05  Treasury taper NatSpec updated to reflect linear decline
+ *            instead of full bypass during exhale.
+ *
+ * ─── v1.3 CHANGES ────────────────────────────────────────────────────
+ *
+ * S2-FIX-25  expireSubscription blocked during dormancy. Swap-and-pop
+ *            during dormancy batch skips users behind the cursor.
+ *            Direct fund loss for innocent subscribers. (HIGH)
+ *
+ * S2-FIX-26  triggerDormancy requires drawPhase == IDLE. Prevents
+ *            dormancy firing while a draw is mid-flight, which would
+ *            corrupt tierPayoutAmounts and prizePot. (MEDIUM)
+ *
+ * S2-FIX-27  Charity code removed entirely. Charity commitment is
+ *            operational: 20% treasury includes charity allocation,
+ *            wallet nominated before launch. Not enforced on-chain.
+ *            Removed: charityWallet, charityBalance, PendingCharityWallet,
+ *            proposeCharityWallet, executeCharityWallet, cancelCharityWallet,
+ *            withdrawCharity, CHARITY_WALLET_DELAY, 3 errors, 4 events. (MEDIUM)
+ *
+ * S2-DOC-06  USDC blacklist risk documented on claimPrize. If Circle
+ *            blacklists a winner, their prizes lock permanently.
+ *            Mitigation deferred to audit team. (MEDIUM)
+ *
+ * S2-DOC-07  getCurrentPotSplitBps NatSpec: exhale return value not
+ *            used for revenue routing. _processPayment uses treasury
+ *            taper instead. (LOW)
+ *
+ * S2-DOC-08  OG continuous subscription design documented. Gap-year
+ *            strategies possible under current code. Team/audit to
+ *            decide if claimOGShare requires active sub at close. (LOW)
+ *
+ * S2-DOC-09  Dormancy NatSpec: intentionally bypasses 80/20 endgame
+ *            split. No OGs exist in dormancy scenario. (INFO)
+ *
+ * S2-DOC-10  getCurrentPerformance staleness: view function does not
+ *            check updatedAt. Cosmetic. _resolveWeek has own check. (INFO)
+ *
+ * S2-DOC-11  Changelog S2-FIX-14 annotated as superseded by S2-FIX-20.
+ *            Was "100% to pot", now "linear taper". (INFO)
+ *
+ * S2-FIX-28  Dormancy guard on subscribe, subscribeDouble, extendSubscription.
+ *            Same class as S2-FIX-25. New subscriber during dormancy batch
+ *            increases activeSubscribers, causing underflow on completion.
+ *            Complete dormancy perimeter: subscribe, subscribeDouble,
+ *            extendSubscription, expireSubscription, triggerDraw,
+ *            performUpkeep, closeGame. (HIGH)
+ *
+ * S2-FIX-29  Dormancy guard on closeGame. Dormancy distributing from
+ *            prizePot while closeGame splits it = double-spend. (LOW)
+ *
+ * S2-FIX-30  Removed unused errors: StaleFeed, InvalidFeedPrice.
+ *            Dead code since try/catch handles stale feeds. (INFO)
+ *
+ * S2-DOC-12  Pre-resolution pick changes documented as by design.
+ *            Watching market mid-week and adjusting picks IS the skill
+ *            game. Post-resolution front-running blocked by drawPhase
+ *            check. Pre-resolution adaptation is gameplay. (INFO)
+ *
+ * S2-DOC-13  Dormancy vs OG interaction documented. Dormancy cannot
+ *            fire while OGs exist: picks persist, triggerDraw is
+ *            permissionless, active OG subscription keeps draws firing.
+ *            Auto-picking unnecessary. Full dormancy-guarded function
+ *            list documented. (INFO)
+ *
+ * S2-FIX-31  expireSubscription blocked during MATCHING/DISTRIBUTING.
+ *            Swap-and-pop during matching moves last subscriber behind
+ *            cursor, skipping them for prizes. matchAndPopulate handles
+ *            expired users internally. (MEDIUM)
+ *
+ * S2-FIX-32  getContractState returns dormancyActive. Frontends need
+ *            this to display game winding down state. (INFO)
+ *
+ * S2-DOC-14  ExhaleStarted event only fires from claimOGStatus. If
+ *            first OG granted via _removeSubscriber or matchAndPopulate,
+ *            event does not fire. Frontends should watch currentWeek. (INFO)
+ *
+ * S2-FIX-33  Pin compiler: ^0.8.24 -> 0.8.24. Standard production
+ *            practice. No surprise compiler changes. (LOW)
+ *
+ * S2-FIX-34  Per-feed staleness thresholds. Replaces single constant
+ *            with uint256[42] array. Set per-feed in constructor. Each
+ *            feed matches its actual Chainlink heartbeat (e.g. BTC 2hr,
+ *            low-cap tokens 24hr). Updated via feed timelock (newStaleness
+ *            added to PendingFeedUpdate struct, applied atomically with
+ *            new feed address). FeedUpdateProposed event includes
+ *            newStaleness. getAllStalenessThresholds() view function
+ *            added for frontend convenience. (MEDIUM - operational)
+ *
+ * S2-FIX-35  _removeSubscriber OG grant: added time check for consistency
+ *            with claimOGStatus and matchAndPopulate. All three OG grant
+ *            paths now require currentWeek >= startWeek + 208 - 1. (LOW)
+ *
+ * S2-FIX-36  Pick lock: PICK_LOCK_BEFORE_RESOLVE = 3 days. Picks frozen
+ *            3 days before resolve window. Players get 4 days to analyse,
+ *            then 3 days of commitment. Applied to: subscribe,
+ *            subscribeDouble, changePicks, changePicksBoth. New subs
+ *            also blocked during lock to prevent first-week front-running.
+ *            Enforces prediction over copying the leaderboard. (MEDIUM)
+ *
+ * S2-FIX-37  FeedDisqualified event emitted in _snapshotStartPrices when
+ *            storing 0. Uses uint8 reason code (1 = stale/invalid, 2 =
+ *            dead/reverted). Gas-efficient vs string. (LOW)
+ *
+ * S2-FIX-38  closeGame decentralization: removed owner grace period.
+ *            Previously only owner could call during weeks 313-316.
+ *            Now anyone calls once currentWeek > 312 or time expires.
+ *            CLOSE_GRACE_WEEKS retained for rescueAbandonedPot
+ *            time-based fallback. (MEDIUM - trustlessness)
+ *
+ * S2-DOC-15  emergencyResetDraw NatSpec: documents that unprocessed
+ *            winners lose current week prizes. Tier amounts return to
+ *            pot. This is the cost of 14-day system failure. (INFO)
+ *
+ * S2-FIX-39  Subscribe during pick lock: deferred start week. Instead
+ *            of blocking new subs, startWeek = currentWeek + 1. Subscriber
+ *            pays from next week. matchAndPopulate skips deferred subs
+ *            (startWeek > currentWeek). _addSubscriber takes explicit
+ *            startWeek param. Prevents first-week front-running while
+ *            keeping the door open for new players. (MEDIUM)
+ *
+ * S2-FIX-40  Ownable2Step. Two-step ownership transfer prevents loss
+ *            to typo. renounceOwnership() overridden to revert. A 6-year
+ *            game cannot become headless. (MEDIUM - safety)
+ *
+ * S2-FIX-41  Aave negative rebase. _captureYield deducts loss from
+ *            prizePot instead of silently ignoring. Floors at zero.
+ *            Keeps books honest if aUSDC balance drops. (LOW)
+ *
+ * S2-FIX-42  Dead game rescue shortcut. rescueAbandonedPot third path:
+ *            zero subs + zero OGs + 90 days since last draw. Prevents
+ *            funds sitting locked for 6 years in a game that died at
+ *            week 50. (MEDIUM - fund recovery)
+ *
+ * S2-FIX-43  arePicksLocked() view function. Frontend convenience to
+ *            check if pick lock window is active. (INFO)
+ *
+ * S2-FIX-44  Removed unused JP_SEED_BPS constant. Dead code. (INFO)
+ *
+ * S2-FIX-45  Non-OG deferred sub into exhale guard. If deferred
+ *            startWeek > INHALE_WEEKS and user is not OG, revert NotOG.
+ *            Prevents paying for weeks that would be skipped. (MEDIUM)
+ *
+ * S2-FIX-46  Aave negative rebase waterfall. prizePot absorbs loss
+ *            first. If insufficient, remainder deducted from treasury.
+ *            Prevents phantom solvency gap when prizePot is zero. (MEDIUM)
+ *
+ * S2-FIX-47  rescueAbandonedPot returns orphaned tier payouts to pot
+ *            before rescue. If a draw was stuck, tierPayoutAmounts would
+ *            be orphaned. Same pattern as emergencyResetDraw. (MEDIUM)
+ *
+ * S2-FIX-48  renounceOwnership uses dedicated RenounceDisabled error
+ *            and pure override. InvalidAddress was misleading for
+ *            monitoring tools. No onlyOwner needed for pure revert. (LOW)
+ *
+ * S2-FIX-49  Removed unused TIER_SEED_BPS constant. Seed is calculated
+ *            as remainder (weeklyPool - tiers - JP). Dead code. (INFO)
+ *
+ * S2-DOC-16  NatSpec on seed remainder calculation. Documents that
+ *            seed = 1000 BPS implicitly from remainder, not from a
+ *            constant. Tier BPS: 2800+2000+1500+2700 = 9000. (INFO)
+ *
+ * S2-FIX-50  JP Overflow: when jackpot is not hit, 20% of that week's
+ *            JP allocation overflows back to prizePot. Remaining 80%
+ *            accumulates in jpReserve. Keeps tier prizes growing during
+ *            long JP dry spells. New constant JP_OVERFLOW_BPS = 2000.
+ *            New event JackpotOverflow. Applied in distributePrizes
+ *            else block (JP miss path). (MEDIUM - game economics)
+ *
+ * Total: 50 code fixes + 16 documentation notes = 66 changes.
+ * Lines: 1,094 (v1.0) -> 1,314 (v1.1) -> 1,457 (v1.2) -> 1,650 (v1.3) -> 1,663 (v1.4)
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@aave/core-v3/contracts/interfaces/IPool.sol";
 
-contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
+contract Crypto42 is Ownable2Step, ReentrancyGuard, AutomationCompatibleInterface {
     using SafeERC20 for IERC20;
 
     error GameFull();
@@ -63,6 +357,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     error DuplicatePickSets();
     error InsufficientBalance();
     error InvalidAddress();
+    error RenounceDisabled();
     error InvalidWeeks();
     error TooEarly();
     error NothingToClaim();
@@ -86,9 +381,14 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     error ExceedsInhale();
     error WrongTicketCount();
     error NotStuck();
-    error StaleFeed();
-    error InvalidFeedPrice();
     error StartPricesNotCaptured();
+    error NoPendingUpdate();
+    error TimelockNotExpired();
+    error AlreadyProposed();
+    error DormancyInProgress();
+    error GameNotAbandoned();
+    error InvalidStaleness();
+    error PicksLocked();
 
     enum DrawPhase { IDLE, MATCHING, DISTRIBUTING }
     enum GamePhase { INHALE, EXHALE, CLOSED }
@@ -146,23 +446,43 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     uint256 public constant TIER_MATCH4_BPS = 2000;
     uint256 public constant TIER_MATCH5_BPS = 1500;
     uint256 public constant TIER_JP_BPS = 2700;
-    uint256 public constant TIER_SEED_BPS = 1000;
+    /// @dev Seed is not a constant. It is the remainder after tiers + JP allocation.
+    ///      10000 - 2800 match3 - 2000 match4 - 1500 match5 - 2700 JP = 1000 BPS seed.
+    ///      Calculated as: weeklyPool - tier0 - tier1 - tier2 - jpAlloc.
     uint256 public constant JP_WEEK_BONUS_BPS = 200;
     uint256 public constant JP_WINNER_BPS = 9000;
-    uint256 public constant JP_SEED_BPS = 1000;
+    /// @dev When JP is not hit, 20% of that week's JP allocation overflows back
+    ///      to prizePot. Remaining 80% accumulates in jpReserve as normal.
+    ///      Keeps tier prizes growing even during long JP dry spells.
+    uint256 public constant JP_OVERFLOW_BPS = 2000;            // 20% overflow to prizePot on JP miss
+    /// @dev OG status requires a single unbroken subscription of 208+ weeks.
+    ///      If a subscriber lapses and resubscribes, startWeek resets. Their
+    ///      prior history is lost. isOG is permanent once granted. Design intent:
+    ///      OGs should maintain continuous subscription for the full game lifecycle.
+    ///      Gap-year strategies (OG at week 208, lapse year 5, return for exhale)
+    ///      are possible under current code. Team/audit to decide if claimOGShare
+    ///      should additionally require active subscription at close time.
     uint256 public constant OG_WEEKS_REQUIRED = 208;
     uint256 public constant OG_CLAIM_EARLY_WEEKS = 4;
     uint256 public constant MAX_PROCESS_PER_TX = 100;
     uint256 public constant MAX_PAYOUTS_PER_TX = 100;
     uint256 public constant DRAW_COOLDOWN = 7 days;
     uint256 public constant DRAW_STUCK_TIMEOUT = 14 days;
+    uint256 public constant PICK_LOCK_BEFORE_RESOLVE = 3 days;  // picks frozen 3 days before resolution window opens
     uint256 public constant EXHALE_TREASURY_CAP_BPS = 2000;
     uint256 public constant EXHALE_TREASURY_PERIOD = 30 days;
     uint256 public constant OG_CLAIM_DEADLINE = 90 days;
     uint256 public constant DORMANCY_THRESHOLD = 8 weeks;
     uint256 public constant SOLVENCY_FLOOR = 10000;
-    uint256 public constant FEED_STALENESS_THRESHOLD = 2 hours;
+    uint256[42] public feedStalenessThresholds;                 // per-feed staleness, set in constructor, updatable via feed timelock
     uint256 public constant PRECISION_MULTIPLIER = 10_000_000_000; // 8 decimal places, matches Chainlink feed precision
+    uint256 public constant FEED_UPDATE_DELAY = 7 days;         // timelock on feed changes, visible on-chain before execution
+    /// @dev Endgame split: 80% to OGs, 20% to treasury. The 20% treasury
+    ///      allocation includes a commitment to direct funds to a nominated
+    ///      charity wallet. Charity wallet will be published before launch.
+    ///      This is an operational commitment, not enforced on-chain.
+    uint256 public constant ENDGAME_OG_BPS = 8000;             // 80% to OGs at closeGame
+    uint256 public constant ENDGAME_TREASURY_BPS = 2000;       // 20% to treasury at closeGame
 
     // State
     uint256 public prizePot;
@@ -187,9 +507,18 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     uint256[3] public tierPayoutAmounts;
     uint256 public lastTreasuryWithdrawTimestamp;
     uint256 public treasuryWithdrawnThisPeriod;
+    uint256 public periodStartTreasuryBalance;
     uint256 public lastWeekActiveTickets;
     int256[42] public weekStartPrices;
     bool public startPricesCaptured;
+
+    // Feed update timelock: owner proposes, 7-day delay, anyone executes
+    struct PendingFeedUpdate {
+        address newFeed;
+        uint256 newStaleness;
+        uint256 executeAfter;
+    }
+    mapping(uint256 => PendingFeedUpdate) public pendingFeedUpdates;
 
     // Subscriber storage
     address[] public subscriberList;
@@ -225,6 +554,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     event WinnerSelected(address indexed winner, uint256 amount, uint256 matchLevel);
     event JackpotHit(uint256 indexed week, uint256 totalPayout, uint256 numWinners, uint256 seedReturn);
     event JackpotRollover(uint256 indexed week, uint256 reserveTotal);
+    event JackpotOverflow(uint256 indexed week, uint256 overflowAmount, uint256 remainingReserve);
     event JackpotBonusApplied(uint256 indexed week, uint256 bonusAmount);
     event PrizeClaimed(address indexed winner, uint256 amount);
     event SeedReturned(uint256 indexed week, uint256 amount);
@@ -234,6 +564,10 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     event TierPayoutDeferred(uint256 indexed week, uint256 tier, uint256 amount);
     event WeekFinalized(uint256 indexed week);
     event OGStatusClaimed(address indexed user, uint256 duration);
+    /// @dev ExhaleStarted only fires from claimOGStatus when totalOGs reaches 1.
+    ///      If the first OG is granted via _removeSubscriber or matchAndPopulate,
+    ///      this event does not fire. Frontends should watch currentWeek crossing
+    ///      INHALE_WEEKS rather than relying solely on this event.
     event ExhaleStarted(uint256 indexed week, uint256 potAtStart);
     event FinalDistribution(uint256 remainingPot, uint256 totalOGs, uint256 perOGShare);
     event OGShareClaimed(address indexed og, uint256 amount);
@@ -242,12 +576,18 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     event DrawReset(uint256 indexed week, string reason);
     event EmergencyReset(uint256 indexed week, DrawPhase fromPhase, string reason);
     event PriceFeedUpdated(uint256 indexed cryptoIndex, address oldFeed, address newFeed);
+    event FeedUpdateProposed(uint256 indexed cryptoIndex, address newFeed, uint256 newStaleness, uint256 executeAfter);
+    event FeedUpdateCancelled(uint256 indexed cryptoIndex);
     event ZeroRevenueCommitted(uint256 targetTimestamp);
     event TreasuryTakeZeroed();
     event StartPricesSnapshotted(uint256 indexed week);
+    /// @dev reason: 1 = stale or invalid price at snapshot, 2 = feed dead or reverted
+    event FeedDisqualified(uint256 indexed cryptoIndex, uint8 reason);
+    event EndgameDistribution(uint256 toOGs, uint256 toTreasury);
 
     constructor(
         address[42] memory _priceFeeds,
+        uint256[42] memory _stalenessThresholds,
         address _usdc,
         address _aavePool,
         address _aUSDC
@@ -257,7 +597,9 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         if (_aUSDC == address(0)) revert InvalidAddress();
         for (uint256 i = 0; i < 42; i++) {
             if (_priceFeeds[i] == address(0)) revert InvalidAddress();
+            if (_stalenessThresholds[i] == 0) revert InvalidStaleness();
             priceFeeds[i] = AggregatorV3Interface(_priceFeeds[i]);
+            feedStalenessThresholds[i] = _stalenessThresholds[i];
         }
         USDC = _usdc;
         AAVE_POOL = _aavePool;
@@ -280,6 +622,10 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         return GamePhase.INHALE;
     }
 
+    /// @notice Returns the pot split BPS for prize distribution calculation.
+    ///         During exhale, _processPayment uses a separate treasury taper
+    ///         (TREASURY_SPLIT_BPS declining to 0). This function's exhale
+    ///         return value is not used for revenue routing.
     function getCurrentPotSplitBps() public view returns (uint256) {
         if (currentWeek <= INHALE_WEEKS) return POT_SPLIT_BPS;
         uint256 exhaleWeek = currentWeek - INHALE_WEEKS;
@@ -294,6 +640,12 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         return effective > PRIZE_RATE_CEILING ? PRIZE_RATE_CEILING : effective;
     }
 
+    /// @notice Returns the treasury take rate as a boolean gate (0 or 2500).
+    ///         During normal operation the actual treasury allocation is
+    ///         (10000 - getCurrentPotSplitBps()) applied to subscription revenue.
+    ///         This function controls WHETHER treasury takes, not HOW MUCH.
+    ///         During exhale, treasury take tapers linearly from 25% to 0%
+    ///         over 52 weeks (calculated in _processPayment, not here).
     function getCurrentTreasuryTakeBps() public view returns (uint256) {
         if (zeroRevenueActive) return 0;
         if (zeroRevenueTimestamp != 0 && block.timestamp >= zeroRevenueTimestamp) return 0;
@@ -304,10 +656,26 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     // AAVE YIELD CAPTURE (S1 FIX-14)
     // ═══════════════════════════════════════════════════════════════════════════════════════════
 
+    /// @notice All Aave yield accrues to prizePot. Treasury and jpReserve do not
+    ///         grow from yield. This is intentional: treasury is funded from
+    ///         subscription revenue only. Yield benefits players exclusively.
     function _captureYield() internal {
         uint256 currentAUSDC = IERC20(aUSDC).balanceOf(address(this));
         if (lastSnapshotAUSDC == 0) { lastSnapshotAUSDC = currentAUSDC; return; }
-        if (currentAUSDC <= lastSnapshotAUSDC) { lastSnapshotAUSDC = currentAUSDC; return; }
+        if (currentAUSDC < lastSnapshotAUSDC) {
+            // Aave negative rebase (extremely rare). Waterfall: prizePot first, treasury second.
+            uint256 loss = lastSnapshotAUSDC - currentAUSDC;
+            if (loss <= prizePot) {
+                prizePot -= loss;
+            } else {
+                uint256 remainder = loss - prizePot;
+                prizePot = 0;
+                treasuryBalance -= remainder > treasuryBalance ? treasuryBalance : remainder;
+            }
+            lastSnapshotAUSDC = currentAUSDC;
+            return;
+        }
+        if (currentAUSDC == lastSnapshotAUSDC) return;
         prizePot += currentAUSDC - lastSnapshotAUSDC;
         lastSnapshotAUSDC = currentAUSDC;
     }
@@ -317,6 +685,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     // ═══════════════════════════════════════════════════════════════════════════════════════════
 
     function subscribe(uint8[6] calldata picks, uint256 weeks) external nonReentrant {
+        if (dormancyActive) revert DormancyInProgress();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
         if (getGamePhase() == GamePhase.CLOSED) revert GameClosed();
         if (weeks == 0) revert InvalidWeeks();
@@ -326,17 +695,23 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         Subscription storage sub = subscriptions[msg.sender];
         if (sub.active) revert AlreadySubscribed();
 
-        uint256 endWeek = currentWeek + weeks - 1;
+        // Deferred start: if subscribing during pick lock, first playable week is next week.
+        // Prevents first-week front-running with near-complete price data.
+        bool duringLock = block.timestamp >= lastDrawTimestamp + DRAW_COOLDOWN - PICK_LOCK_BEFORE_RESOLVE;
+        uint256 startWeek = duringLock ? currentWeek + 1 : currentWeek;
+        if (startWeek > INHALE_WEEKS && !isOG[msg.sender]) revert NotOG();
         uint256 maxWeek = isOG[msg.sender] ? TOTAL_WEEKS : INHALE_WEEKS;
-        if (endWeek > maxWeek) { endWeek = maxWeek; weeks = maxWeek - currentWeek + 1; }
+        if (startWeek > maxWeek) revert ExceedsInhale();
+        uint256 endWeek = startWeek + weeks - 1;
+        if (endWeek > maxWeek) { endWeek = maxWeek; weeks = endWeek - startWeek + 1; }
 
         uint256 totalCost = weeks * TICKET_PRICE;
         _processPayment(msg.sender, totalCost);
 
         uint64 mask1 = _toBitmask(picks);
         uint8[6] memory empty;
-        _addSubscriber(msg.sender, picks, empty, mask1, 0, endWeek, 1);
-        emit Subscribed(msg.sender, currentWeek, endWeek, 1, totalCost);
+        _addSubscriber(msg.sender, picks, empty, mask1, 0, startWeek, endWeek, 1);
+        emit Subscribed(msg.sender, startWeek, endWeek, 1, totalCost);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -344,6 +719,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     // ═══════════════════════════════════════════════════════════════════════════════════════════
 
     function subscribeDouble(uint8[6] calldata picks1, uint8[6] calldata picks2, uint256 weeks) external nonReentrant {
+        if (dormancyActive) revert DormancyInProgress();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
         if (getGamePhase() == GamePhase.CLOSED) revert GameClosed();
         if (weeks == 0) revert InvalidWeeks();
@@ -355,21 +731,27 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         Subscription storage sub = subscriptions[msg.sender];
         if (sub.active) revert AlreadySubscribed();
 
-        uint256 endWeek = currentWeek + weeks - 1;
+        bool duringLock = block.timestamp >= lastDrawTimestamp + DRAW_COOLDOWN - PICK_LOCK_BEFORE_RESOLVE;
+        uint256 startWeek = duringLock ? currentWeek + 1 : currentWeek;
+        if (startWeek > INHALE_WEEKS && !isOG[msg.sender]) revert NotOG();
         uint256 maxWeek = isOG[msg.sender] ? TOTAL_WEEKS : INHALE_WEEKS;
-        if (endWeek > maxWeek) { endWeek = maxWeek; weeks = maxWeek - currentWeek + 1; }
+        if (startWeek > maxWeek) revert ExceedsInhale();
+        uint256 endWeek = startWeek + weeks - 1;
+        if (endWeek > maxWeek) { endWeek = maxWeek; weeks = endWeek - startWeek + 1; }
 
         uint256 totalCost = weeks * TICKET_PRICE * 2;
         _processPayment(msg.sender, totalCost);
 
         uint64 mask1 = _toBitmask(picks1);
         uint64 mask2 = _toBitmask(picks2);
-        _addSubscriber(msg.sender, picks1, picks2, mask1, mask2, endWeek, 2);
-        emit Subscribed(msg.sender, currentWeek, endWeek, 2, totalCost);
+        _addSubscriber(msg.sender, picks1, picks2, mask1, mask2, startWeek, endWeek, 2);
+        emit Subscribed(msg.sender, startWeek, endWeek, 2, totalCost);
     }
 
     function extendSubscription(uint256 additionalWeeks) external nonReentrant {
+        if (dormancyActive) revert DormancyInProgress();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
+        if (getGamePhase() == GamePhase.CLOSED) revert GameClosed();
         if (additionalWeeks == 0) revert InvalidWeeks();
         Subscription storage sub = subscriptions[msg.sender];
         if (!sub.active) revert NotSubscriber();
@@ -386,7 +768,17 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         emit SubscriptionExtended(msg.sender, newEndWeek, totalCost);
     }
 
+    /// @notice Changing picks while drawPhase == IDLE (before resolution) is by design.
+    ///         This is a skill-based prediction game. Watching market movements mid-week
+    ///         and adjusting picks is the core gameplay loop. Post-resolution front-running
+    ///         is blocked by the drawPhase check. Pre-resolution adaptation is skill.
+    ///         Picks lock PICK_LOCK_BEFORE_RESOLVE (3 days) before the resolve window
+    ///         opens. Players get 4 days to analyse and adjust, then 3 days of commitment.
+    ///         If a draw is delayed (Automation down), the lock persists until the
+    ///         delayed draw fires. This is correct: resolution is overdue and imminent.
     function changePicks(uint8[6] calldata newPicks) external {
+        if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
+        if (block.timestamp >= lastDrawTimestamp + DRAW_COOLDOWN - PICK_LOCK_BEFORE_RESOLVE) revert PicksLocked();
         Subscription storage sub = subscriptions[msg.sender];
         if (!sub.active) revert NotSubscriber();
         _validatePicks(newPicks);
@@ -399,6 +791,8 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     }
 
     function changePicksBoth(uint8[6] calldata newPicks1, uint8[6] calldata newPicks2) external {
+        if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
+        if (block.timestamp >= lastDrawTimestamp + DRAW_COOLDOWN - PICK_LOCK_BEFORE_RESOLVE) revert PicksLocked();
         Subscription storage sub = subscriptions[msg.sender];
         if (!sub.active) revert NotSubscriber();
         if (sub.ticketsPerWeek != 2) revert WrongTicketCount();
@@ -413,6 +807,8 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     }
 
     function expireSubscription(address user) external {
+        if (dormancyActive) revert DormancyInProgress();
+        if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
         Subscription storage sub = subscriptions[user];
         if (!sub.active) revert NotSubscriber();
         if (sub.endWeek >= currentWeek) revert SubscriptionNotExpired();
@@ -435,8 +831,18 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         uint256 treasuryTakeBps = getCurrentTreasuryTakeBps();
         uint256 toPot;
         uint256 toTreasury;
-        if (treasuryTakeBps == 0) { toPot = totalCost; toTreasury = 0; }
-        else {
+        if (treasuryTakeBps == 0) {
+            toPot = totalCost; toTreasury = 0;
+        } else if (getGamePhase() == GamePhase.EXHALE) {
+            uint256 exhaleWeek = currentWeek - INHALE_WEEKS;
+            if (exhaleWeek >= EXHALE_WEEKS) {
+                toPot = totalCost; toTreasury = 0;
+            } else {
+                uint256 taperBps = TREASURY_SPLIT_BPS * (EXHALE_WEEKS - exhaleWeek) / EXHALE_WEEKS;
+                toTreasury = totalCost * taperBps / 10000;
+                toPot = totalCost - toTreasury;
+            }
+        } else {
             uint256 potSplitBps = getCurrentPotSplitBps();
             toPot = totalCost * potSplitBps / 10000;
             toTreasury = totalCost - toPot;
@@ -445,13 +851,13 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         treasuryBalance += toTreasury;
     }
 
-    function _addSubscriber(address user, uint8[6] memory p1, uint8[6] memory p2, uint64 mask1, uint64 mask2, uint256 endWeek, uint8 ticketsPerWeek) internal {
+    function _addSubscriber(address user, uint8[6] memory p1, uint8[6] memory p2, uint64 mask1, uint64 mask2, uint256 startWeek, uint256 endWeek, uint8 ticketsPerWeek) internal {
         if (activeSubscribers >= MAX_USERS) revert GameFull();
         subscriberList.push(user);
         Subscription storage sub = subscriptions[user];
         sub.picks1 = p1; sub.picks2 = p2;
         sub.pickBitmask1 = mask1; sub.pickBitmask2 = mask2;
-        sub.startWeek = currentWeek; sub.endWeek = endWeek;
+        sub.startWeek = startWeek; sub.endWeek = endWeek;
         sub.listIndex = subscriberList.length;
         sub.active = true; sub.ticketsPerWeek = ticketsPerWeek;
         activeSubscribers++;
@@ -462,7 +868,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         uint256 idx = sub.listIndex - 1;
         if (!isOG[user] && sub.startWeek > 0) {
             uint256 duration = sub.endWeek - sub.startWeek + 1;
-            if (duration >= OG_WEEKS_REQUIRED) {
+            if (duration >= OG_WEEKS_REQUIRED && currentWeek >= sub.startWeek + OG_WEEKS_REQUIRED - 1) {
                 isOG[user] = true; totalOGs++;
                 emit OGStatusClaimed(user, duration);
             }
@@ -500,6 +906,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         upkeepNeeded = (
             block.timestamp >= lastDrawTimestamp + DRAW_COOLDOWN &&
             drawPhase == DrawPhase.IDLE &&
+            !dormancyActive &&
             subscriberList.length > 0 &&
             getGamePhase() != GamePhase.CLOSED &&
             startPricesCaptured
@@ -510,6 +917,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     function performUpkeep(bytes calldata) external override nonReentrant {
         if (block.timestamp < lastDrawTimestamp + DRAW_COOLDOWN) revert CooldownActive();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
+        if (dormancyActive) revert DormancyInProgress();
         if (subscriberList.length == 0) revert NoActiveSubscribers();
         if (getGamePhase() == GamePhase.CLOSED) revert GameClosed();
         if (!startPricesCaptured) revert StartPricesNotCaptured();
@@ -519,6 +927,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     function triggerDraw() external nonReentrant {
         if (block.timestamp < lastDrawTimestamp + DRAW_COOLDOWN) revert CooldownActive();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
+        if (dormancyActive) revert DormancyInProgress();
         if (subscriberList.length == 0) revert NoActiveSubscribers();
         if (getGamePhase() == GamePhase.CLOSED) revert GameClosed();
         if (!startPricesCaptured) revert StartPricesNotCaptured();
@@ -534,14 +943,12 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         int256[42] memory performance;
 
         for (uint256 i = 0; i < POOL_SIZE; i++) {
-            // Try/catch: one bad/dead/paused feed cannot brick the game.
-            // Disqualified cryptos get worst possible performance. Can't win. Game continues.
             try priceFeeds[i].latestRoundData() returns (
                 uint80, int256 endPrice, uint256, uint256 updatedAt, uint80
             ) {
                 int256 startPrice = weekStartPrices[i];
                 if (
-                    block.timestamp - updatedAt > FEED_STALENESS_THRESHOLD ||
+                    block.timestamp - updatedAt > feedStalenessThresholds[i] ||
                     endPrice <= 0 ||
                     startPrice <= 0
                 ) {
@@ -554,7 +961,6 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
             }
         }
 
-        // Selection sort: find top 6. Tiebreaker: lower index wins.
         uint8[6] memory topSix;
         bool[42] memory used;
 
@@ -583,12 +989,17 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     function _snapshotStartPrices() internal {
         for (uint256 i = 0; i < POOL_SIZE; i++) {
             try priceFeeds[i].latestRoundData() returns (
-                uint80, int256 price, uint256, uint256, uint80
+                uint80, int256 price, uint256, uint256 updatedAt, uint80
             ) {
-                weekStartPrices[i] = price;
+                if (price <= 0 || block.timestamp - updatedAt > feedStalenessThresholds[i]) {
+                    weekStartPrices[i] = 0;
+                    emit FeedDisqualified(i, 1);
+                } else {
+                    weekStartPrices[i] = price;
+                }
             } catch {
-                // Feed dead/paused: store 0. resolveWeek will disqualify this crypto.
                 weekStartPrices[i] = 0;
+                emit FeedDisqualified(i, 2);
             }
         }
         startPricesCaptured = true;
@@ -646,6 +1057,9 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
                 continue;
             }
 
+            // Deferred start: subscriber joined during pick lock, starts next week
+            if (sub.startWeek > currentWeek) { matchingIndex++; processed++; continue; }
+
             if (isExhale) {
                 bool userIsOG = isOG[user];
                 if (!userIsOG) {
@@ -659,17 +1073,23 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
                 if (!userIsOG) { matchingIndex++; processed++; continue; }
             }
 
-            uint256 best = _popcount(winMask & sub.pickBitmask1);
+            uint256 m1 = _popcount(winMask & sub.pickBitmask1);
+            lastWeekActiveTickets++;
+
+            if (m1 == 6) { weeklyResults[currentWeek].jackpotWinners.push(user); totalWinnersThisDraw++; }
+            else if (m1 == 5) { weeklyResults[currentWeek].match5.push(user); totalWinnersThisDraw++; }
+            else if (m1 == 4) { weeklyResults[currentWeek].match4.push(user); totalWinnersThisDraw++; }
+            else if (m1 >= 3) { weeklyResults[currentWeek].match3.push(user); totalWinnersThisDraw++; }
+
             if (sub.ticketsPerWeek == 2) {
                 uint256 m2 = _popcount(winMask & sub.pickBitmask2);
-                if (m2 > best) best = m2;
-            }
-            lastWeekActiveTickets += sub.ticketsPerWeek;
+                lastWeekActiveTickets++;
 
-            if (best == 6) { weeklyResults[currentWeek].jackpotWinners.push(user); totalWinnersThisDraw++; }
-            else if (best == 5) { weeklyResults[currentWeek].match5.push(user); totalWinnersThisDraw++; }
-            else if (best == 4) { weeklyResults[currentWeek].match4.push(user); totalWinnersThisDraw++; }
-            else if (best >= 3) { weeklyResults[currentWeek].match3.push(user); totalWinnersThisDraw++; }
+                if (m2 == 6) { weeklyResults[currentWeek].jackpotWinners.push(user); totalWinnersThisDraw++; }
+                else if (m2 == 5) { weeklyResults[currentWeek].match5.push(user); totalWinnersThisDraw++; }
+                else if (m2 == 4) { weeklyResults[currentWeek].match4.push(user); totalWinnersThisDraw++; }
+                else if (m2 >= 3) { weeklyResults[currentWeek].match3.push(user); totalWinnersThisDraw++; }
+            }
 
             matchingIndex++;
             processed++;
@@ -693,7 +1113,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         if (drawPhase != DrawPhase.DISTRIBUTING) revert WrongPhase();
         uint256 creditsThisTx = 0;
 
-        if (distributionTierIndex == 0 && distributionWinnerIndex == 0) {
+        if (distributionTierIndex == 0 && distributionWinnerIndex == 0 && !jpHitThisWeek) {
             address[] storage jpWinners = weeklyResults[currentWeek].jackpotWinners;
             if (jpWinners.length > 0) {
                 jpHitThisWeek = true;
@@ -702,7 +1122,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
                 uint256 seedReturn = jpReserve - winnerPayout;
                 uint256 perWinner = winnerPayout / jpWinners.length;
                 uint256 dust = winnerPayout - (perWinner * jpWinners.length);
-                for (uint256 i = 0; i < jpWinners.length && creditsThisTx < MAX_PAYOUTS_PER_TX; i++) {
+                for (uint256 i = 0; i < jpWinners.length; i++) {
                     unclaimedPrizes[jpWinners[i]] += perWinner;
                     totalUnclaimedPrizes += perWinner;
                     emit WinnerSelected(jpWinners[i], perWinner, 6);
@@ -726,6 +1146,14 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
                 emit JackpotBonusApplied(currentWeek, bonus);
                 jpReserve = 0;
             } else {
+                // JP Overflow: 20% of this week's JP allocation returns to prizePot.
+                // Remaining 80% stays in jpReserve. Keeps the pot growing for tier
+                // winners even during long JP dry spells. JP still accumulates.
+                uint256 thisWeekJP = weeklyResults[currentWeek].prizePool * TIER_JP_BPS / 10000;
+                uint256 overflow = thisWeekJP * JP_OVERFLOW_BPS / 10000;
+                jpReserve -= overflow;
+                prizePot += overflow;
+                emit JackpotOverflow(currentWeek, overflow, jpReserve);
                 emit JackpotRollover(currentWeek, jpReserve);
             }
         }
@@ -804,21 +1232,25 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     // ═══════════════════════════════════════════════════════════════════════════════════════════
 
     function closeGame() external nonReentrant {
+        if (dormancyActive) revert DormancyInProgress();
         bool weeksExpired = currentWeek > TOTAL_WEEKS;
         bool timeExpired = block.timestamp >= DEPLOY_TIMESTAMP + ((TOTAL_WEEKS + CLOSE_GRACE_WEEKS) * 1 weeks);
         if (!weeksExpired && !timeExpired) revert TooEarly();
-        if (weeksExpired && currentWeek <= TOTAL_WEEKS + CLOSE_GRACE_WEEKS) {
-            if (!timeExpired && msg.sender != owner()) revert TooEarly();
-        }
         if (finalDistributionDone) revert AlreadyClaimed();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
         if (totalOGs == 0) revert ExceedsLimit();
         _captureYield();
         prizePot += jpReserve; jpReserve = 0;
-        ogShareAmount = prizePot / totalOGs;
+        uint256 totalPot = prizePot;
+        uint256 toOGs = totalPot * ENDGAME_OG_BPS / 10000;
+        uint256 toTreasury = totalPot - toOGs;
+        ogShareAmount = toOGs / totalOGs;
+        treasuryBalance += toTreasury;
+        prizePot = toOGs;
         finalDistributionDone = true;
         closeTimestamp = block.timestamp;
-        emit FinalDistribution(prizePot, totalOGs, ogShareAmount);
+        emit EndgameDistribution(toOGs, toTreasury);
+        emit FinalDistribution(toOGs, totalOGs, ogShareAmount);
     }
 
     function claimOGShare() external nonReentrant {
@@ -850,12 +1282,34 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         emit UnclaimedOGSharesSwept(remaining, treasuryBalance);
     }
 
+    function rescueAbandonedPot() external nonReentrant {
+        bool weeksExpired = currentWeek > TOTAL_WEEKS;
+        bool timeExpired = block.timestamp >= DEPLOY_TIMESTAMP + ((TOTAL_WEEKS + CLOSE_GRACE_WEEKS) * 1 weeks);
+        bool dormantLongEnough = activeSubscribers == 0 && totalOGs == 0 && block.timestamp >= lastDrawTimestamp + 90 days;
+        if (!weeksExpired && !timeExpired && !dormantLongEnough) revert TooEarly();
+        if (totalOGs > 0) revert GameNotAbandoned();
+        if (activeSubscribers > 0) revert GameNotAbandoned();
+        if (finalDistributionDone) revert AlreadyClaimed();
+        for (uint256 i = 0; i < 3; i++) {
+            if (tierPayoutAmounts[i] > 0) { prizePot += tierPayoutAmounts[i]; tierPayoutAmounts[i] = 0; }
+        }
+        _captureYield();
+        uint256 remaining = prizePot + jpReserve;
+        prizePot = 0;
+        jpReserve = 0;
+        treasuryBalance += remaining;
+        finalDistributionDone = true;
+        closeTimestamp = block.timestamp;
+        emit FinalDistribution(remaining, 0, 0);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════════════════════
     // DORMANCY: THE SQUID GAME CLAUSE (batched)
     // ═══════════════════════════════════════════════════════════════════════════════════════════
 
     function triggerDormancy() external nonReentrant {
         if (finalDistributionDone) revert NotClosed();
+        if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
         if (block.timestamp < lastDrawTimestamp + DORMANCY_THRESHOLD) revert TooEarly();
         if (activeSubscribers == 0) revert NoActiveSubscribers();
         if (!dormancyActive) {
@@ -946,7 +1400,8 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     }
 
     function getEstimatedOGShare() external view returns (uint256 perOG, uint256 pot, uint256 ogCount) {
-        pot = prizePot + jpReserve; ogCount = totalOGs;
+        pot = (prizePot + jpReserve) * ENDGAME_OG_BPS / 10000;
+        ogCount = totalOGs;
         perOG = ogCount > 0 ? pot / ogCount : 0;
     }
 
@@ -960,7 +1415,14 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
 
     function getPotHealth() external view returns (uint256 pot, uint256 weeklyInflow, uint256 weeklyOutflow, uint256 healthRatio, uint256 currentRateBps) {
         pot = prizePot;
-        weeklyInflow = lastWeekActiveTickets * TICKET_PRICE * POT_SPLIT_BPS / 10000;
+        if (getGamePhase() == GamePhase.EXHALE) {
+            uint256 exhaleWeek = currentWeek - INHALE_WEEKS;
+            uint256 taperBps = exhaleWeek >= EXHALE_WEEKS ? 0 : TREASURY_SPLIT_BPS * (EXHALE_WEEKS - exhaleWeek) / EXHALE_WEEKS;
+            uint256 potBps = 10000 - taperBps;
+            weeklyInflow = lastWeekActiveTickets * TICKET_PRICE * potBps / 10000;
+        } else {
+            weeklyInflow = lastWeekActiveTickets * TICKET_PRICE * POT_SPLIT_BPS / 10000;
+        }
         currentRateBps = getEffectivePrizeRateBps();
         weeklyOutflow = pot * currentRateBps / 10000;
         healthRatio = weeklyOutflow > 0 ? weeklyInflow * 10000 / weeklyOutflow : type(uint256).max;
@@ -983,9 +1445,9 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     function getContractState() external view returns (
         DrawPhase phase, GamePhase gamePhase, uint256 week,
         uint256 pot, uint256 jpRes, uint256 treasury, uint256 unclaimed,
-        uint256 subs, bool matching, uint256 ogCount
+        uint256 subs, bool matching, uint256 ogCount, bool dormancy
     ) {
-        return (drawPhase, getGamePhase(), currentWeek, prizePot, jpReserve, treasuryBalance, totalUnclaimedPrizes, activeSubscribers, matchingInProgress, totalOGs);
+        return (drawPhase, getGamePhase(), currentWeek, prizePot, jpReserve, treasuryBalance, totalUnclaimedPrizes, activeSubscribers, matchingInProgress, totalOGs, dormancyActive);
     }
 
     function isValidPicks(uint8[6] calldata picks) external pure returns (bool valid, string memory reason) {
@@ -1001,20 +1463,33 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
 
     function getAllTickers() external view returns (string[42] memory) { return CRYPTO_TICKERS; }
     function getWeekStartPrices() external view returns (int256[42] memory) { return weekStartPrices; }
+    function getAllStalenessThresholds() external view returns (uint256[42] memory) { return feedStalenessThresholds; }
+    function arePicksLocked() external view returns (bool) { return block.timestamp >= lastDrawTimestamp + DRAW_COOLDOWN - PICK_LOCK_BEFORE_RESOLVE; }
 
-    /// @notice Live performance for all 42 (frontend leaderboard mid-week).
     function getCurrentPerformance() external view returns (int256[42] memory perf) {
         for (uint256 i = 0; i < POOL_SIZE; i++) {
-            (, int256 endPrice,,,) = priceFeeds[i].latestRoundData();
-            int256 startPrice = weekStartPrices[i];
-            if (startPrice > 0 && endPrice > 0) { perf[i] = (endPrice - startPrice) * int256(PRECISION_MULTIPLIER) / startPrice; }
-            else { perf[i] = 0; }
+            try priceFeeds[i].latestRoundData() returns (
+                uint80, int256 endPrice, uint256, uint256, uint80
+            ) {
+                int256 startPrice = weekStartPrices[i];
+                if (startPrice > 0 && endPrice > 0) {
+                    perf[i] = (endPrice - startPrice) * int256(PRECISION_MULTIPLIER) / startPrice;
+                } else {
+                    perf[i] = 0;
+                }
+            } catch {
+                perf[i] = 0;
+            }
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════════
     // OWNER FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
 
     function commitToZeroRevenue(uint256 targetTimestamp) external onlyOwner {
         if (zeroRevenueTimestamp != 0) revert AlreadyCommitted();
@@ -1030,8 +1505,9 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
             if (block.timestamp >= lastTreasuryWithdrawTimestamp + EXHALE_TREASURY_PERIOD) {
                 treasuryWithdrawnThisPeriod = 0;
                 lastTreasuryWithdrawTimestamp = block.timestamp;
+                periodStartTreasuryBalance = treasuryBalance;
             }
-            uint256 maxThisPeriod = treasuryBalance * EXHALE_TREASURY_CAP_BPS / 10000;
+            uint256 maxThisPeriod = periodStartTreasuryBalance * EXHALE_TREASURY_CAP_BPS / 10000;
             if (treasuryWithdrawnThisPeriod + amount > maxThisPeriod) revert ExhaleWithdrawalCap();
             treasuryWithdrawnThisPeriod += amount;
         }
@@ -1046,21 +1522,43 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         emit TreasuryWithdrawal(received, recipient);
     }
 
-    /// @notice Update individual price feed. For Chainlink feed migrations only.
-    function updatePriceFeed(uint256 index, address newFeed) external onlyOwner {
+    function proposeFeedUpdate(uint256 index, address newFeed, uint256 newStaleness) external onlyOwner {
         if (index >= POOL_SIZE) revert InvalidPickIndex();
         if (newFeed == address(0)) revert InvalidAddress();
+        if (newStaleness == 0) revert InvalidStaleness();
+        if (pendingFeedUpdates[index].newFeed != address(0)) revert AlreadyProposed();
+        pendingFeedUpdates[index] = PendingFeedUpdate({
+            newFeed: newFeed,
+            newStaleness: newStaleness,
+            executeAfter: block.timestamp + FEED_UPDATE_DELAY
+        });
+        emit FeedUpdateProposed(index, newFeed, newStaleness, block.timestamp + FEED_UPDATE_DELAY);
+    }
+
+    function executeFeedUpdate(uint256 index) external {
+        if (index >= POOL_SIZE) revert InvalidPickIndex();
+        PendingFeedUpdate memory pending = pendingFeedUpdates[index];
+        if (pending.newFeed == address(0)) revert NoPendingUpdate();
+        if (block.timestamp < pending.executeAfter) revert TimelockNotExpired();
         if (drawPhase != DrawPhase.IDLE) revert DrawInProgress();
         address oldFeed = address(priceFeeds[index]);
-        priceFeeds[index] = AggregatorV3Interface(newFeed);
-        emit PriceFeedUpdated(index, oldFeed, newFeed);
+        priceFeeds[index] = AggregatorV3Interface(pending.newFeed);
+        feedStalenessThresholds[index] = pending.newStaleness;
+        delete pendingFeedUpdates[index];
+        emit PriceFeedUpdated(index, oldFeed, pending.newFeed);
+    }
+
+    function cancelFeedUpdate(uint256 index) external onlyOwner {
+        if (pendingFeedUpdates[index].newFeed == address(0)) revert NoPendingUpdate();
+        delete pendingFeedUpdates[index];
+        emit FeedUpdateCancelled(index);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════════
     // EMERGENCY / RECOVERY
     // ═══════════════════════════════════════════════════════════════════════════════════════════
 
-    function emergencyResetDraw() external onlyOwner {
+    function emergencyResetDraw() external {
         if (block.timestamp <= lastResolveTimestamp + DRAW_STUCK_TIMEOUT) revert TooEarly();
         DrawPhase currentPhase = drawPhase;
         if (currentPhase == DrawPhase.IDLE) revert NotStuck();
@@ -1078,7 +1576,7 @@ contract Crypto42 is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
         emit EmergencyReset(currentWeek - 1, currentPhase, "Manual reset");
     }
 
-    function forceCompleteDistribution() external onlyOwner {
+    function forceCompleteDistribution() external {
         if (drawPhase != DrawPhase.DISTRIBUTING) revert WrongPhase();
         if (block.timestamp <= lastResolveTimestamp + DRAW_STUCK_TIMEOUT) revert TooEarly();
         for (uint256 i = distributionTierIndex; i < 3; i++) {
