@@ -15,7 +15,7 @@ Built on the same pot engine as The Official Rug v1. Same Aave V3 yield, same OG
 - Match 3/4/5/6 pays out from tiered prize pools.
 - Subscribe once, play for years.
 
-## The 42 Cryptos
+## The 42 Cryptos (e.g.)
 
 | Index | Ticker | Index | Ticker | Index | Ticker | Index | Ticker |
 |-------|--------|-------|--------|-------|--------|-------|--------|
